@@ -4564,7 +4564,41 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
 
-        all_attachments = list(message.attachments) + snapshot_attachments
+        # Resolve the message being replied to early, so attachments from the
+        # replied message can be passed into Hermes vision/media handling.
+        reply_to_id = None
+        reply_to_text = None
+        reply_attachments = []
+
+        if message.reference:
+            reply_to_id = str(message.reference.message_id) if message.reference.message_id else None
+            ref_msg = getattr(message.reference, "resolved", None)
+
+            # Discord does not always include the referenced message in the
+            # gateway event, so fetch it when needed.
+            if ref_msg is None and reply_to_id and self._client:
+                try:
+                    ref_channel_id = (
+                        getattr(message.reference, "channel_id", None)
+                        or getattr(message.channel, "id", None)
+                    )
+                    ref_channel = self._client.get_channel(int(ref_channel_id))
+                    if ref_channel is None:
+                        ref_channel = await self._client.fetch_channel(int(ref_channel_id))
+                    ref_msg = await ref_channel.fetch_message(int(reply_to_id))
+                except Exception as e:
+                    logger.debug(
+                        "[%s] Could not fetch replied Discord message %s: %s",
+                        self.name,
+                        reply_to_id,
+                        e,
+                    )
+
+            if ref_msg is not None:
+                reply_to_text = getattr(ref_msg, "content", None) or None
+                reply_attachments = list(getattr(ref_msg, "attachments", []) or [])
+
+        all_attachments = list(message.attachments) + snapshot_attachments + reply_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -4803,13 +4837,6 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
-
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
         event = MessageEvent(
             text=event_text,

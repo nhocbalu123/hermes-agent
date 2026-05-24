@@ -1,0 +1,5 @@
+name: kill
+version: 1.0.0
+kind: backend
+description: "Fun /kill and /slay commands — LLM generates fictional kill messages. /kill is rageful vengeance; /slay is slapstick absurdism."
+author: "you"
