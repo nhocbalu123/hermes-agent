@@ -16,6 +16,7 @@ plugin bugs and infrastructure issues. Model search log: see MODEL_SEARCH_LOG.md
 | `.hermes/.env` | GOOGLE_API_KEY, CEREBRAS_API_KEY, GEMINI_API_KEY |
 | `.hermes/SOUL.md` | Brevity hard limit added, no-tool-call rule added, GIF section rewritten for text-only, GIF placeholder example replaced, bracket-placeholder prohibition added |
 | `agent/conversation_loop.py` | Rate-limit wait before fallback: reads `retry-after` header on 429, waits up to 120s and retries same provider (up to 5 times) before falling back |
+| `plugins/platforms/discord/adapter.py` | Embed image extraction from replied-to messages: linked images (not direct uploads) stored as embeds now forwarded to vision pipeline |
 
 ---
 
@@ -867,6 +868,116 @@ primaries are text-only.
 6. Description prepended to the user's message; primary model (stepfun/GLM) sees text only
 
 `config.yaml` changes take effect after gateway restart.
+
+---
+
+## Bug 14 — SOUL.md edits ignored until a new session is started
+
+**Symptom:** Editing `~/.hermes/SOUL.md` has no visible effect on the Discord bot's
+behavior, even though the file header says "Loaded fresh each message — no restart needed."
+
+**Root cause:** The comment in SOUL.md is wrong. The system prompt is **not** reloaded
+per message. It is built once on the first turn of a new session, stored in `state.db`,
+and then reloaded from `state.db` verbatim on every subsequent turn so the upstream
+prefix-cache KV stays warm (`conversation_loop.py:179-182`):
+
+```python
+if stored_prompt:
+    # Continuing session — reuse the exact system prompt from the
+    # previous turn so the Anthropic cache prefix matches.
+    agent._cached_system_prompt = stored_prompt
+    return
+```
+
+A new session is only created when the session ID rotates — which happens on `/new`,
+`/reset`, or when the session expires. Restarting the gateway alone is not enough if
+the existing session entry in `state.db` already has a stored prompt; the agent reloads
+from `state.db` on the first message after restart and sees the old prompt again.
+
+**Why the comment is wrong:** The "no restart" note was written for the CLI/TUI where
+sessions are short-lived and the comment is effectively true. In Discord, sessions are
+long-lived and the caching behaviour dominates.
+
+**Misleading notes in this file:** Several earlier entries end with
+`"SOUL.md is loaded fresh each message — no restart needed."` — those notes are
+incorrect for Discord sessions.
+
+**Fix — `~/.hermes/SOUL.md`:** Updated the HTML comment at the top:
+- Before: `Loaded fresh each message — no restart needed.`
+- After: `Changes apply to new sessions only. Send /new in Discord to pick up edits.`
+
+**How to apply a SOUL.md edit immediately:**
+
+Send `/new` (or `/reset`) in Discord. This rotates the session ID. The next message
+creates a fresh agent that reads SOUL.md from scratch.
+
+**How to apply to all current sessions (nuclear option):**
+
+See "Correct procedure: purging poisoned sessions" above — same steps, but query for
+all sessions rather than just blocked ones. After purging, every channel's next message
+rebuilds from the current SOUL.md.
+
+---
+
+## Bug 15 — Bot can't see images when user replies to a linked image
+
+**Symptom:** User replies to a Discord message containing an image and asks the bot
+to analyze it. Bot responds: "bạn gửi hình lên đi, ở đây tớ không thấy hình nào để
+phân tích" ("please send the image, I don't see any image to analyze").
+
+Gateway log confirms the message arrived as plain text with no image context:
+```
+INFO gateway.run: inbound message: platform=discord user=Lu Khang msg='phân tích hình này'
+```
+No vision routing, no image caching, no `vision_analyze` call — 1 API call, 6.8s total.
+
+**Root cause:** `adapter.py` line 4599 only reads `ref_msg.attachments` from the
+referenced message:
+
+```python
+reply_attachments = list(getattr(ref_msg, "attachments", []) or [])
+```
+
+When a user posts an image via a **link** (not a direct file upload), Discord stores it
+as an embed in `ref_msg.embeds`, not in `ref_msg.attachments`. The attachments list is
+empty, so `all_attachments` is empty, `msg_type` stays `TEXT`, `media_urls` stays `[]`,
+and the agent sees only text.
+
+Direct uploads → `message.attachments` ✓ (already handled)
+Linked images → `message.embeds` ✗ (was not handled)
+
+**Relevant embed types:**
+- `type="image"` — pure image embed (user pasted a direct image URL)
+- `type="gifv"` — animated GIF embed
+- `type="rich"` — rich embed; image lives in `embed.image.url` or `embed.thumbnail.url`
+
+**Fix — `plugins/platforms/discord/adapter.py`:**
+
+After collecting `reply_attachments` from `ref_msg.attachments`, walk `ref_msg.embeds`
+and extract any image URLs. Each is wrapped in a `types.SimpleNamespace` with `url` and
+`content_type` attributes so it routes through the existing `_cache_discord_image` logic
+(which falls back to URL download when the object has no `read()` method):
+
+```python
+for _embed in (getattr(ref_msg, "embeds", None) or []):
+    _etype = getattr(_embed, "type", None)
+    _img_url = None
+    if _etype in ("image", "gifv"):
+        _img_url = getattr(_embed, "url", None)
+    elif _etype == "rich":
+        _img_field = getattr(_embed, "image", None) or getattr(_embed, "thumbnail", None)
+        _img_url = getattr(_img_field, "url", None) if _img_field else None
+    if _img_url:
+        _ext = os.path.splitext(_img_url.split("?")[0])[-1].lower()
+        _ct = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(_ext, "image/jpeg")
+        reply_attachments.append(_types.SimpleNamespace(url=_img_url, content_type=_ct, filename=None, size=None))
+```
+
+Once `reply_attachments` is non-empty, `all_attachments` is non-empty, `msg_type` is
+set to `PHOTO`, and the image is routed through `_enrich_message_with_vision` →
+`vision_analyze_tool` → Gemini as normal.
+
+**Commit:** `e194925f7`
 
 ---
 
