@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import types as _types
 import struct
 import subprocess
 import tempfile
@@ -4597,6 +4598,22 @@ class DiscordAdapter(BasePlatformAdapter):
             if ref_msg is not None:
                 reply_to_text = getattr(ref_msg, "content", None) or None
                 reply_attachments = list(getattr(ref_msg, "attachments", []) or [])
+                # Also collect images from embeds on the referenced message.
+                # Linked images (not direct uploads) are stored as embeds, not
+                # attachments — without this, replying to a linked image gives
+                # the bot no visual context.
+                for _embed in (getattr(ref_msg, "embeds", None) or []):
+                    _etype = getattr(_embed, "type", None)
+                    _img_url = None
+                    if _etype in ("image", "gifv"):
+                        _img_url = getattr(_embed, "url", None)
+                    elif _etype == "rich":
+                        _img_field = getattr(_embed, "image", None) or getattr(_embed, "thumbnail", None)
+                        _img_url = getattr(_img_field, "url", None) if _img_field else None
+                    if _img_url:
+                        _ext = os.path.splitext(_img_url.split("?")[0])[-1].lower()
+                        _ct = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(_ext, "image/jpeg")
+                        reply_attachments.append(_types.SimpleNamespace(url=_img_url, content_type=_ct, filename=None, size=None))
 
         all_attachments = list(message.attachments) + snapshot_attachments + reply_attachments
 
