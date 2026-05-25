@@ -993,6 +993,7 @@ def run_conversation(
         oauth_1m_beta_retry_attempted = False
         llama_cpp_grammar_retry_attempted = False
         has_retried_429 = False
+        rate_limit_wait_count = 0
         restart_with_compressed_messages = False
         restart_with_length_continuation = False
 
@@ -2464,6 +2465,39 @@ def run_conversation(
                         base_url=getattr(agent, "base_url", None),
                     )
                     if not pool_may_recover:
+                        # If the 429 carries a retry-after header, wait for the
+                        # token window to reset and retry the same provider instead
+                        # of falling back. Groq TPM windows reset in ≤60s; waiting
+                        # is cheaper than abandoning the primary model. Cap at 5
+                        # waits so a stuck quota still eventually falls back.
+                        _retry_after = None
+                        try:
+                            _rl_hdrs = getattr(
+                                getattr(api_error, "response", None), "headers", None
+                            ) or {}
+                            _ra_val = (
+                                _rl_hdrs.get("retry-after")
+                                or _rl_hdrs.get("Retry-After")
+                            )
+                            if _ra_val:
+                                _s = float(_ra_val)
+                                if 0 < _s <= 120:
+                                    _retry_after = _s
+                        except Exception:
+                            pass
+                        if _retry_after is not None and rate_limit_wait_count < 5:
+                            rate_limit_wait_count += 1
+                            agent._emit_status(
+                                f"⏱️ Rate limited — waiting {_retry_after:.0f}s for "
+                                f"token window to reset ({rate_limit_wait_count}/5)..."
+                            )
+                            _rl_wait_end = time.time() + _retry_after
+                            while time.time() < _rl_wait_end:
+                                if agent._interrupt_requested:
+                                    break
+                                time.sleep(0.2)
+                            retry_count = 0
+                            continue
                         agent._emit_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
