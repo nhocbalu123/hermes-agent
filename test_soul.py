@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Test Hermes SOUL.md persona across many Discord-like scenarios.
-Uses OpenRouter directly so SOUL.md is the actual system prompt.
+Tests both OpenRouter (z-ai/glm-4.5-air:free) and the live Nous inference
+model (deepseek/deepseek-v4-flash:free) so results reflect the actual bot.
 """
 
 import os
@@ -15,6 +16,32 @@ SOUL_PATH = os.path.join(os.path.dirname(__file__), "SOUL.md")
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = "z-ai/glm-4.5-air:free"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# ── Nous inference provider (reads agent_key from auth.json) ──────────────
+def _load_nous_config() -> tuple[str, str, str]:
+    """Return (api_key, base_url, model) for the Nous provider, or ('','','') if unavailable."""
+    try:
+        auth_path = os.path.expanduser("~/.hermes/auth.json")
+        cfg_path  = os.path.expanduser("~/.hermes/config.yaml")
+        with open(auth_path) as f:
+            auth = json.load(f)
+        nous = auth.get("providers", {}).get("nous", {})
+        key  = nous.get("agent_key", "")
+        url  = nous.get("inference_base_url", "https://inference-api.nousresearch.com/v1")
+        # read default model from config.yaml (simple line scan, no yaml dep)
+        model = "deepseek/deepseek-v4-flash:free"
+        with open(cfg_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("default:") and "provider:" not in line:
+                    model = stripped.split("default:", 1)[1].strip()
+                    break
+        return key, url.rstrip("/"), model
+    except Exception:
+        return "", "", ""
+
+NOUS_KEY, NOUS_BASE_URL, NOUS_MODEL = _load_nous_config()
+NOUS_API_URL = f"{NOUS_BASE_URL}/chat/completions" if NOUS_BASE_URL else ""
 
 # ── kill/slay plugin system prompts (must match plugins/kill/__init__.py) ──
 _KILL_SYSTEM_PROMPT = (
@@ -130,10 +157,21 @@ def load_soul():
         return f.read()
 
 
-def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800) -> dict:
+def _provider_headers(api_key: str, api_url: str) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if "openrouter" in api_url:
+        headers["HTTP-Referer"] = "https://discord-test"
+    return headers
+
+
+def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800,
+              api_key: str = "", api_url: str = "", model: str = "") -> dict:
     """Raw API call returning the full choice dict (content, tool_calls, finish_reason, error)."""
+    _key   = api_key  or API_KEY
+    _url   = api_url  or API_URL
+    _model = model    or MODEL
     payload_dict: dict = {
-        "model": MODEL,
+        "model": _model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -145,16 +183,7 @@ def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800) -
         payload_dict["tools"] = tools
 
     payload = json.dumps(payload_dict).encode()
-    req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord-test",
-        },
-        method="POST",
-    )
+    req = urllib.request.Request(_url, data=payload, headers=_provider_headers(_key, _url), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
@@ -175,9 +204,13 @@ def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800) -
         return {"content": None, "tool_calls": [], "finish": None, "error": str(e)}
 
 
-def ask(system_prompt: str, user_msg: str) -> str:
+def ask(system_prompt: str, user_msg: str, *,
+        api_key: str = "", api_url: str = "", model: str = "") -> str:
+    _key   = api_key  or API_KEY
+    _url   = api_url  or API_URL
+    _model = model    or MODEL
     payload = json.dumps({
-        "model": MODEL,
+        "model": _model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
@@ -186,23 +219,13 @@ def ask(system_prompt: str, user_msg: str) -> str:
         "temperature": 0.85,
     }).encode()
 
-    req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord-test",
-        },
-        method="POST",
-    )
+    req = urllib.request.Request(_url, data=payload, headers=_provider_headers(_key, _url), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
             msg = data["choices"][0]["message"]
             content = msg.get("content")
             if content is None:
-                # Reasoning model exhausted tokens in thinking phase
                 return "[MODEL RAN OUT OF TOKENS IN THINKING PHASE]"
             return content.strip()
     except urllib.error.HTTPError as e:
@@ -232,7 +255,7 @@ def check_response(category: str, msg: str, reply: str) -> tuple[str, str]:
     if category == "Identity":
         if len(reply) > 150:
             return "WARN", "Identity reply too long"
-        if not any(c in reply for c in ["~", "🌸", "😳", "hermes", "Hermes", "bot"]):
+        if not any(c in reply for c in ["~", "🌸", "😳", "hermes", "Hermes", "jenny", "Jenny", "bot"]):
             return "WARN", "Identity reply missing personality markers"
 
     # Femboy/cute responses should show flustered behavior
@@ -254,7 +277,7 @@ def check_response(category: str, msg: str, reply: str) -> tuple[str, str]:
     return "PASS", ""
 
 
-def test_gif_tool(soul: str) -> dict[str, int]:
+def test_gif_tool(soul: str, *, api_key: str = "", api_url: str = "", model: str = "") -> dict[str, int]:
     """§ GIF Tool — verify model calls run_terminal with a valid Giphy curl command.
 
     Pass criteria:
@@ -270,7 +293,7 @@ def test_gif_tool(soul: str) -> dict[str, int]:
     ]
     results = {"PASS": 0, "WARN": 0, "FAIL": 0}
     for prompt, term, expect_tool in cases:
-        r = _call_api(soul, prompt, tools=_DISCORD_TOOLS)
+        r = _call_api(soul, prompt, tools=_DISCORD_TOOLS, api_key=api_key, api_url=api_url, model=model)
         print(f"{CYAN}[GIF Tool]{RESET} {BOLD}{prompt}{RESET}")
         if r["error"]:
             status = "FAIL"
@@ -311,7 +334,7 @@ def test_gif_tool(soul: str) -> dict[str, int]:
     return results
 
 
-def test_vision(soul: str) -> dict[str, int]:
+def test_vision(soul: str, *, api_key: str = "", api_url: str = "", model: str = "") -> dict[str, int]:
     """§ Vision — check image handling for a text-only model.
 
     Two sub-tests:
@@ -331,7 +354,7 @@ def test_vision(soul: str) -> dict[str, int]:
         {"type": "image_url", "image_url": {"url": _TEST_IMAGE_URL}},
         {"type": "text", "text": "what's in this image?"},
     ]
-    r = _call_api(soul, image_content, tools=_DISCORD_TOOLS)
+    r = _call_api(soul, image_content, tools=_DISCORD_TOOLS, api_key=api_key, api_url=api_url, model=model)
     print(f"{CYAN}[Vision]{RESET} {BOLD}native image_url content{RESET}")
     if r["error"]:
         if "404" in r["error"] and ("image" in r["error"].lower() or "modality" in r["error"].lower() or "endpoint" in r["error"].lower()):
@@ -350,7 +373,8 @@ def test_vision(soul: str) -> dict[str, int]:
     time.sleep(0.5)
 
     # (b) Text message mentioning image URL (Discord attachment pasted as text)
-    r2 = _call_api(soul, f"what do you see in this pic? {_TEST_IMAGE_URL}", tools=_DISCORD_TOOLS)
+    r2 = _call_api(soul, f"what do you see in this pic? {_TEST_IMAGE_URL}", tools=_DISCORD_TOOLS,
+                   api_key=api_key, api_url=api_url, model=model)
     print(f"{CYAN}[Vision]{RESET} {BOLD}text message with image URL{RESET}")
     if r2["error"]:
         status, note = "FAIL", r2["error"][:100]
@@ -449,21 +473,28 @@ def test_kill_slay() -> dict[str, int]:
     return results
 
 
-def main():
-    if not API_KEY:
-        print(f"{RED}OPENROUTER_API_KEY not set. Source ~/.hermes/.env first.{RESET}")
-        sys.exit(1)
+def run_suite(soul: str, label: str, *,
+              api_key: str, api_url: str, model: str) -> dict[str, dict[str, int]]:
+    """Run the full persona + feature test suite for one provider. Returns all result buckets."""
+    print(f"\n{'═' * 60}")
+    print(f"{BOLD}▶ Provider: {label}  |  Model: {model}{RESET}")
+    print(f"{'═' * 60}\n")
 
-    soul = load_soul()
-    print(f"{BOLD}Hermes SOUL.md Test Suite{RESET}")
-    print(f"{GRAY}Model: {MODEL} | Cases: {len(TEST_CASES)}{RESET}\n")
-
-    results = {"PASS": 0, "WARN": 0, "FAIL": 0}
+    results: dict[str, int] = {"PASS": 0, "WARN": 0, "FAIL": 0}
     by_category: dict[str, list] = {}
+
+    # Probe with one call first — bail early if auth is stale
+    probe = ask(soul, "yo", api_key=api_key, api_url=api_url, model=model)
+    if "401" in probe:
+        print(f"{RED}✗ Auth failed (HTTP 401) — run `hermes auth` and retry immediately.{RESET}\n")
+        return {"persona": {"PASS": 0, "WARN": 0, "FAIL": 1},
+                "gif_tool": {"PASS": 0, "WARN": 0, "FAIL": 0},
+                "vision":   {"PASS": 0, "WARN": 0, "FAIL": 0},
+                "kill_slay": {"PASS": 0, "WARN": 0, "FAIL": 0}}
 
     for category, msg in TEST_CASES:
         print(f"{CYAN}[{category}]{RESET} {BOLD}{msg}{RESET}")
-        reply = ask(soul, msg)
+        reply = ask(soul, msg, api_key=api_key, api_url=api_url, model=model)
         status, note = check_response(category, msg, reply)
 
         color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
@@ -474,16 +505,12 @@ def main():
 
         results[status] += 1
         by_category.setdefault(category, []).append(status)
-
-        # Small delay to avoid rate limits on free tier
         time.sleep(0.5)
 
     print("─" * 60)
-    print(f"{BOLD}Results:{RESET} {GREEN}{results['PASS']} PASS{RESET} | "
+    print(f"{BOLD}Persona Results:{RESET} {GREEN}{results['PASS']} PASS{RESET} | "
           f"{YELLOW}{results['WARN']} WARN{RESET} | {RED}{results['FAIL']} FAIL{RESET}")
     print()
-
-    print(f"{BOLD}By category:{RESET}")
     for cat, statuses in by_category.items():
         fails = statuses.count("FAIL")
         warns = statuses.count("WARN")
@@ -491,31 +518,52 @@ def main():
         color = GREEN if icon == "✓" else (RED if icon == "✗" else YELLOW)
         print(f"  {color}{icon}{RESET} {cat}: {statuses.count('PASS')}/{len(statuses)} pass")
 
-    # ── Feature-specific tests ────────────────────────────────────────────
-    gif_r    = test_gif_tool(soul)
-    vision_r = test_vision(soul)
-    kill_r   = test_kill_slay()
+    gif_r    = test_gif_tool(soul, api_key=api_key, api_url=api_url, model=model)
+    vision_r = test_vision(soul, api_key=api_key, api_url=api_url, model=model)
+    kill_r   = test_kill_slay()  # kill/slay uses its own system prompts, provider-agnostic
 
-    # Combined summary
-    all_results = {
-        "persona":  results,
-        "gif_tool": gif_r,
-        "vision":   vision_r,
-        "kill_slay": kill_r,
-    }
+    return {"persona": results, "gif_tool": gif_r, "vision": vision_r, "kill_slay": kill_r}
+
+
+def print_summary(label: str, all_results: dict[str, dict[str, int]]) -> None:
     total_pass = sum(r["PASS"] for r in all_results.values())
     total_warn = sum(r["WARN"] for r in all_results.values())
     total_fail = sum(r["FAIL"] for r in all_results.values())
-
-    print("\n" + "═" * 60)
-    print(f"{BOLD}FULL SUITE TOTALS:{RESET}")
+    print(f"\n{BOLD}Summary — {label}{RESET}")
     for suite, r in all_results.items():
         n = r["PASS"] + r["WARN"] + r["FAIL"]
         icon = "✓" if r["FAIL"] == 0 and r["WARN"] == 0 else ("✗" if r["FAIL"] > 0 else "~")
         color = GREEN if icon == "✓" else (RED if icon == "✗" else YELLOW)
-        print(f"  {color}{icon}{RESET} {suite:<12} {r['PASS']}/{n} pass  "
-              f"({r['WARN']} warn, {r['FAIL']} fail)")
-    print(f"\n  {GREEN}{total_pass} PASS{RESET} | {YELLOW}{total_warn} WARN{RESET} | {RED}{total_fail} FAIL{RESET}")
+        print(f"  {color}{icon}{RESET} {suite:<12} {r['PASS']}/{n} pass  ({r['WARN']} warn, {r['FAIL']} fail)")
+    print(f"  → {GREEN}{total_pass} PASS{RESET} | {YELLOW}{total_warn} WARN{RESET} | {RED}{total_fail} FAIL{RESET}")
+
+
+def main():
+    if not API_KEY:
+        print(f"{RED}OPENROUTER_API_KEY not set. Source ~/.hermes/.env first.{RESET}")
+        sys.exit(1)
+
+    soul = load_soul()
+    print(f"{BOLD}Jenny SOUL.md Test Suite{RESET}")
+    print(f"{GRAY}{len(TEST_CASES)} persona cases + GIF / Vision / Kill-Slay feature tests{RESET}")
+
+    providers = [
+        ("OpenRouter (z-ai/glm-4.5-air:free)", API_KEY, API_URL, MODEL),
+    ]
+    if NOUS_KEY and NOUS_API_URL:
+        print(f"\n{YELLOW}⚠ Nous agent_key expires quickly — run `hermes auth` right before this test for valid results.{RESET}")
+        providers.append((f"Nous ({NOUS_MODEL})", NOUS_KEY, NOUS_API_URL, NOUS_MODEL))
+    else:
+        print(f"\n{YELLOW}⚠ Nous provider not available (no agent_key found) — run `hermes auth` then retry.{RESET}")
+
+    summaries = {}
+    for label, key, url, mdl in providers:
+        summaries[label] = run_suite(soul, label, api_key=key, api_url=url, model=mdl)
+
+    print(f"\n{'═' * 60}")
+    print(f"{BOLD}FINAL COMPARISON{RESET}")
+    for label, all_results in summaries.items():
+        print_summary(label, all_results)
 
 
 if __name__ == "__main__":
