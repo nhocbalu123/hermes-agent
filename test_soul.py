@@ -14,7 +14,8 @@ import urllib.error
 
 SOUL_PATH = os.path.join(os.path.dirname(__file__), "SOUL.md")
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = "z-ai/glm-4.5-air:free"
+# Free OpenRouter models come and go; override with SOUL_TEST_OPENROUTER_MODEL.
+MODEL = os.environ.get("SOUL_TEST_OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Nous inference provider (reads agent_key from auth.json) ──────────────
@@ -92,7 +93,7 @@ _VISION_TOOL = {
 _DISCORD_TOOLS = [_TERMINAL_TOOL, _VISION_TOOL]
 
 # Public domain test image (Wikimedia cat photo)
-_TEST_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
+_TEST_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg"  # thumb/ URLs now return 400
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -402,7 +403,7 @@ def test_vision(soul: str, *, api_key: str = "", api_url: str = "", model: str =
     return results
 
 
-def test_kill_slay() -> dict[str, int]:
+def test_kill_slay(*, api_key: str = "", api_url: str = "", model: str = "") -> dict[str, int]:
     """§ Kill/Slay — plugin system prompts against the primary model.
 
     Simulates what plugins/kill/__init__.py does: calls the primary provider
@@ -420,7 +421,7 @@ def test_kill_slay() -> dict[str, int]:
 
     print(f"  {GRAY}-- /kill --{RESET}")
     for name in kill_names:
-        r = _call_api(_KILL_SYSTEM_PROMPT, name, max_tokens=400)
+        r = _call_api(_KILL_SYSTEM_PROMPT, name, max_tokens=400, api_key=api_key, api_url=api_url, model=model)
         print(f"{CYAN}[Kill]{RESET} {BOLD}/kill {name}{RESET}")
         if r["error"]:
             status, note = "FAIL", r["error"][:100]
@@ -449,7 +450,7 @@ def test_kill_slay() -> dict[str, int]:
 
     print(f"  {GRAY}-- /slay --{RESET}")
     for name in slay_names:
-        r = _call_api(_SLAY_SYSTEM_PROMPT, name, max_tokens=400)
+        r = _call_api(_SLAY_SYSTEM_PROMPT, name, max_tokens=400, api_key=api_key, api_url=api_url, model=model)
         print(f"{CYAN}[Slay]{RESET} {BOLD}/slay {name}{RESET}")
         if r["error"]:
             status, note = "FAIL", r["error"][:100]
@@ -520,7 +521,7 @@ def run_suite(soul: str, label: str, *,
 
     gif_r    = test_gif_tool(soul, api_key=api_key, api_url=api_url, model=model)
     vision_r = test_vision(soul, api_key=api_key, api_url=api_url, model=model)
-    kill_r   = test_kill_slay()  # kill/slay uses its own system prompts, provider-agnostic
+    kill_r   = test_kill_slay(api_key=api_key, api_url=api_url, model=model)  # plugin prompts on the model under test
 
     return {"persona": results, "gif_tool": gif_r, "vision": vision_r, "kill_slay": kill_r}
 
@@ -548,11 +549,14 @@ def main():
     print(f"{GRAY}{len(TEST_CASES)} persona cases + GIF / Vision / Kill-Slay feature tests{RESET}")
 
     providers = [
-        ("OpenRouter (z-ai/glm-4.5-air:free)", API_KEY, API_URL, MODEL),
+        (f"OpenRouter ({MODEL})", API_KEY, API_URL, MODEL),
     ]
     if NOUS_KEY and NOUS_API_URL:
         print(f"\n{YELLOW}⚠ Nous agent_key expires quickly — run `hermes auth` right before this test for valid results.{RESET}")
-        providers.append((f"Nous ({NOUS_MODEL})", NOUS_KEY, NOUS_API_URL, NOUS_MODEL))
+        # SOUL_TEST_NOUS_MODELS="a,b" compares several Nous models; default is the bot's configured model.
+        nous_models = [m.strip() for m in os.environ.get("SOUL_TEST_NOUS_MODELS", "").split(",") if m.strip()] or [NOUS_MODEL]
+        for nm in nous_models:
+            providers.append((f"Nous ({nm})", NOUS_KEY, NOUS_API_URL, nm))
     else:
         print(f"\n{YELLOW}⚠ Nous provider not available (no agent_key found) — run `hermes auth` then retry.{RESET}")
 
