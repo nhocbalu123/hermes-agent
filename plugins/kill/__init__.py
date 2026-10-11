@@ -4,6 +4,13 @@ import random
 _log = logging.getLogger(__name__)
 
 
+# Last resort when config doesn't name a Groq model (llama-3.3-70b-versatile was retired by Groq).
+_GROQ_LAST_RESORT_MODEL = "qwen/qwen3.8-27b"
+# Reasoning models (e.g. stepfun/step-5-preview) spend tokens thinking before the short reply;
+# 400 left them with finish=length and empty content. The prompts keep the visible reply short.
+_MAX_TOKENS = 2000
+
+
 def _provider_chain():
     """Return [(provider, model), ...] built from config.yaml fallback_providers.
 
@@ -11,9 +18,12 @@ def _provider_chain():
     fallback_providers entry in order. Falls back to groq if config is unreadable.
     """
     chain = [(None, None)]
+    groq_model = _GROQ_LAST_RESORT_MODEL
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
+        groq_cfg = (cfg.get("providers") or {}).get("groq") or {}
+        groq_model = (groq_cfg.get("default_model") or "").strip() or groq_model
         fallback = cfg.get("fallback_providers") or []
         # fallback_providers may be stored as a JSON string in config.yaml
         if isinstance(fallback, str):
@@ -33,7 +43,7 @@ def _provider_chain():
         pass
     # Always ensure groq is available as a last resort for this fun command
     if not any(p == "groq" for p, _ in chain):
-        chain.append(("groq", "llama-3.3-70b-versatile"))
+        chain.append(("groq", groq_model))
     return chain
 
 
@@ -75,7 +85,7 @@ async def _llm_with_retry(ctx, messages, system_prompt, purpose):
             result = await ctx.llm.acomplete(
                 messages=full_messages,
                 temperature=0.9,
-                max_tokens=400,
+                max_tokens=_MAX_TOKENS,
                 purpose=purpose,
                 provider=provider,
                 model=model,
