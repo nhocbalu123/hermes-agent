@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import logging
 import os
+import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, NamedTuple, Optional
@@ -622,6 +624,44 @@ def _unlink_quietly(path: Optional[Path]) -> None:
             pass
 
 
+_last_vision_download_cleanup: Dict[str, float] = {}
+_DELIVERABLE_EXT = {"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
+
+
+def _cleanup_old_vision_downloads(save_dir: Path, max_age_hours: int = 24) -> None:
+    """Remove vision_downloaded_* files older than max_age_hours (throttled to 1/hour)."""
+    key = str(save_dir)
+    now = time.time()
+    if now - _last_vision_download_cleanup.get(key, 0.0) < 3600:
+        return
+    _last_vision_download_cleanup[key] = now
+    cutoff = now - (max_age_hours * 3600)
+    for f in save_dir.glob("vision_downloaded_*"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except Exception as exc:
+            logger.debug("Failed to clean old vision download %s: %s", f, exc)
+
+
+def _persist_remote_image_for_delivery(image_url: str, prepared: "_PreparedImage") -> Optional[str]:
+    """Copy a downloaded remote image into a media-delivery safe root so the model can share it
+    with ``MEDIA:<saved_path>``; the prepared temp file itself is always deleted. Local paths and
+    data: URLs are skipped (nothing was downloaded)."""
+    if not isinstance(image_url, str) or not image_url.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        save_dir = _secure_cache_dir("cache/screenshots", "browser_screenshots")
+        _cleanup_old_vision_downloads(save_dir)
+        ext = _DELIVERABLE_EXT.get(prepared.mime or "", ".jpg")
+        dest = save_dir / f"vision_downloaded_{uuid.uuid4().hex}{ext}"
+        shutil.copyfile(prepared.path, dest)
+        return str(dest)
+    except Exception as exc:
+        logger.debug("Could not persist vision download for delivery: %s", exc)
+        return None
+
+
 class _ImagePrepError(ValueError):
     """Raised by :func:`_prepare_image`; the message is user-facing."""
 
@@ -737,10 +777,16 @@ async def _vision_analyze_native(
         embedded = True
         if not reserved:
             _record_embed(image_url)
-        return _build_native_vision_tool_result(
+        result = _build_native_vision_tool_result(
             image_url=image_url, question=question, image_data_url=image_data_url,
             image_size_bytes=prepared.size_bytes,
             scale_note=_build_scale_note(_scale_info or None, prepared.crop_offset or None))
+        saved_path = await asyncio.to_thread(_persist_remote_image_for_delivery, image_url, prepared)
+        if saved_path:
+            result["meta"]["saved_path"] = saved_path
+            result["content"][0]["text"] += (
+                f"\n\nsaved_path: {saved_path} — use MEDIA:<saved_path> to share this image with the user.")
+        return result
     except Exception as exc:
         logger.warning("Native vision fast path failed: %s", exc)
         return tool_error(f"Native vision failed: {exc}", success=False)
@@ -889,9 +935,14 @@ async def vision_analyze_tool(
     task_id: Optional[str] = None, region: Optional[list] = None) -> str:
     """Describe an image (URL, local path, data: URL) with the auxiliary vision LLM. ``user_prompt``
     is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/."""
+    saved: Dict[str, str] = {}
+
     async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
         prepared = await _prepare_image(image_url, task_id, region, validate_decode=False)
         temp_paths.append(prepared.path)
+        _saved_path = await asyncio.to_thread(_persist_remote_image_for_delivery, image_url, prepared)
+        if _saved_path:
+            saved["path"] = _saved_path
         logger.info("Image ready (%.1f KB)", prepared.size_bytes / 1024)
         # Send at full resolution first; on a size rejection, downscale and retry.
         logger.info("Converting image to base64...")
@@ -922,7 +973,17 @@ async def vision_analyze_tool(
         analysis = await _call_vision_llm(
             call_kwargs, "Vision LLM returned empty content, retrying once", response)
         return analysis, _build_scale_note(_scale_info or None, prepared.crop_offset or None)
-    return await _run_analysis("image", image_url, user_prompt, model, stage)
+    out = await _run_analysis("image", image_url, user_prompt, model, stage)
+    if saved.get("path"):
+        # Expose the local copy so the model can deliver the image via MEDIA:<saved_path>.
+        try:
+            payload = json.loads(out)
+            if payload.get("success"):
+                payload["saved_path"] = saved["path"]
+                out = json.dumps(payload, indent=2, ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+    return out
 
 
 def check_video_requirements() -> bool:
@@ -965,7 +1026,8 @@ VISION_ANALYZE_SCHEMA = {
         # doesn't need to predict plumbing.
         "Load an image into the conversation so you can see it. Call it "
         "any time the user references an image — then answer from what "
-        "you see."
+        "you see. For a remote URL the result includes `saved_path`; use "
+        "MEDIA:<saved_path> to share that image with the user."
     ),
     "parameters": {
         "type": "object",

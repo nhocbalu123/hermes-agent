@@ -5120,6 +5120,14 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         final_model = _normalize_resolved_model(
             model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini", provider,
         )
+        # A custom base URL that is actually a native Gemini endpoint (generativelanguage.googleapis.com)
+        # goes through GeminiNativeClient: the OpenAI-compat path returns 500 for image/vision calls.
+        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+        if is_native_gemini_base_url(custom_base):
+            _gkey = _normalize_api_key(req.explicit_api_key) or os.getenv("GOOGLE_API_KEY", "").strip()
+            if _gkey:
+                logger.debug("resolve_provider_client: custom→native-gemini (%s)", final_model)
+                return _route_client(req, GeminiNativeClient(api_key=_gkey, base_url=custom_base), final_model)
         extra = {}
         _clean_base, _dq = _extract_url_query_params(custom_base)
         if _dq:

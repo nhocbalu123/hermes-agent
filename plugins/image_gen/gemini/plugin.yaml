@@ -1,0 +1,7 @@
+name: gemini
+version: 1.0.0
+description: "Google Gemini image generation backend (gemini-2.5-flash-image). Saves generated images to $HERMES_HOME/cache/generated/images/."
+author: local
+kind: backend
+requires_env:
+  - GOOGLE_API_KEY
