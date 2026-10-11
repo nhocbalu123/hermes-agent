@@ -868,6 +868,9 @@ def _dispatch_browser_command(
             # a DevTools endpoint, so the session's daemon attaches to the port it advertises instead.
             # Same daemon (keyed by --session) either way, so snapshot refs stay valid across commands.
             backend_args += ["--cdp", str(bd_port)]
+        elif not _bt._is_camofox_mode() and (profile_dir := _cloud._get_persistent_profile_dir()):
+            # Persistent Chrome profile: reuse cookies / login state across sessions (local launch only).
+            backend_args += ["--profile", profile_dir]
         if _cloud._is_headed_mode():
             backend_args.append("--headed")
         if engine != "auto" and not _bt._is_camofox_mode():

@@ -147,7 +147,10 @@ def _run_chrome_fallback_command(task_id: str, command: str, args: List[str], ti
                     "hermes pm install chromium")
         return {"success": False, "error": hint}
 
-    base_args = _session._agent_browser_argv(browser_cmd) + ["--engine", "chrome", "--session", tmp_session, "--json"]
+    base_args = _session._agent_browser_argv(browser_cmd) + ["--engine", "chrome", "--session", tmp_session]
+    if profile_dir := _cloud._get_persistent_profile_dir():
+        base_args += ["--profile", profile_dir]
+    base_args.append("--json")
     task_socket_dir = _session._prepare_session_socket_dir(tmp_session)
     # Bypasses _run_browser_command, so apply the same Chromium sandbox/screen policy explicitly.
     _session._ensure_screen_for_headed_chromium()

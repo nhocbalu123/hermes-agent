@@ -217,6 +217,24 @@ def _get_browser_engine() -> str:
     return _memo(_bt, "_browser_engine_resolved", "_cached_browser_engine", compute)
 
 
+def _get_persistent_profile_dir() -> Optional[str]:
+    """Persistent Chrome user-data dir for local sessions, or None.
+
+    ``AGENT_BROWSER_PROFILE_DIR`` env var first, then ``browser.profile_dir``; ``~`` expands and the
+    directory is created. With it, agent-browser gets ``--profile <dir>`` so cookies, logins and
+    localStorage survive across sessions and gateway restarts.
+    """
+    _bt = _origin()
+    path = os.environ.get("AGENT_BROWSER_PROFILE_DIR", "").strip()
+    if not path:
+        path = _bt._browser_cfg("profile_dir", "", lambda v: str(v or "").strip(), "browser.profile_dir from config")
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    os.makedirs(expanded, exist_ok=True)
+    return expanded
+
+
 def _is_headed_mode() -> bool:
     """True when the browser should launch headed: ``browser.headed``, else ``AGENT_BROWSER_HEADED``; cached."""
     _bt = _origin()
