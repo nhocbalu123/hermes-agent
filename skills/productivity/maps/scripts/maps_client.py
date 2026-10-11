@@ -531,7 +531,7 @@ def cmd_search(args):
                 "min_lon": float(bb[2]) if len(bb) > 2 else None,
                 "max_lon": float(bb[3]) if len(bb) > 3 else None,
             },
-            "importance":   item.get("importance"),
+            "nominatim_relevance": item.get("importance"),  # internal OSM relevance weight (0–1), NOT a user rating
         })
 
     print_json({

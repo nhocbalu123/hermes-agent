@@ -183,6 +183,14 @@ current.
   falls back between mirrors (overpass-api.de → overpass.kumi.systems)
 - `distance` and `directions` use `--to` flag for the destination (not positional)
 - If a zip code alone gives ambiguous results globally, include country/state
+- **`nominatim_relevance` is NOT a rating.** The `search` command returns a
+  `nominatim_relevance` field (a float 0–1, Nominatim's internal ranking weight).
+  Never present it to the user as stars, a score, or a quality indicator.
+  OpenStreetMap has no user ratings — do not invent them.
+- **`nearby` cannot search for houses or buildings.** The 46 supported categories
+  cover amenities, services, and leisure (see list above). Residential buildings
+  (`house`, `building`, `apartments`) are not supported — tell the user this
+  clearly and offer relevant POI categories instead.
 
 ## Verification
 

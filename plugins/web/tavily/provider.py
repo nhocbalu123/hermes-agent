@@ -73,7 +73,7 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]:
-    """Map Tavily ``/search`` response to ``{success, data: {web: [...]}}``."""
+    """Map Tavily ``/search`` response to ``{success, data: {web: [...], images: [...]}}``."""
     web_results = []
     for i, result in enumerate(response.get("results", [])):
         web_results.append(
@@ -84,7 +84,19 @@ def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]
                 "position": i + 1,
             }
         )
-    return {"success": True, "data": {"web": web_results}}
+
+    images = []
+    for img in response.get("images", []):
+        if isinstance(img, str) and img:
+            images.append({"url": img})
+        elif isinstance(img, dict) and img.get("url"):
+            images.append({"url": img["url"], "description": img.get("description", "")})
+
+    data: Dict[str, Any] = {"web": web_results}
+    if images:
+        data["images"] = images
+
+    return {"success": True, "data": data}
 
 
 def _normalize_tavily_documents(
@@ -177,7 +189,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
                     "query": query,
                     "max_results": min(limit, 20),
                     "include_raw_content": False,
-                    "include_images": False,
+                    "include_images": True,
                 },
             )
             return _normalize_tavily_search_results(raw)
