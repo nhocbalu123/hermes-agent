@@ -6,6 +6,8 @@ model (deepseek/deepseek-v4-flash:free) so results reflect the actual bot.
 """
 
 import os
+import re
+import subprocess
 import sys
 import json
 import time
@@ -165,6 +167,67 @@ def _provider_headers(api_key: str, api_url: str) -> dict:
     return headers
 
 
+# Free tiers rate-limit bursts. Retry 429s (Retry-After header / retry_after body, else
+# exponential backoff, capped at 120s) so a run measures the model, not the limiter.
+_MAX_RETRIES = int(os.environ.get("SOUL_TEST_MAX_RETRIES", "6"))
+_CALL_DELAY = float(os.environ.get("SOUL_TEST_DELAY", "0.5"))  # pause between test calls
+
+
+def _retry_wait(err: urllib.error.HTTPError, body: str, attempt: int) -> float:
+    header = err.headers.get("Retry-After") if err.headers else None
+    try:
+        if header:
+            return min(float(header), 120.0)
+    except ValueError:
+        pass
+    m = re.search(r'"retry_after(?:_seconds)?"\s*:\s*([\d.]+)', body)
+    if m:
+        return min(float(m.group(1)), 120.0)
+    return min(10.0 * 2 ** attempt, 120.0)
+
+
+def _refresh_nous_key() -> bool:
+    """Nous agent keys live ~1h; Hermes renews them with the stored refresh token. Do the same
+    via ``hermes auth refresh nous`` and reload the key so long runs don't die on 401."""
+    global NOUS_KEY
+    try:
+        subprocess.run(["hermes", "auth", "refresh", "nous"], capture_output=True, timeout=120, check=True)
+    except Exception as e:
+        print(f"  {YELLOW}⚠ could not refresh Nous key: {e}{RESET}")
+        return False
+    key, _, _ = _load_nous_config()
+    if key:
+        NOUS_KEY = key
+    return bool(key)
+
+
+def _post_json(req: urllib.request.Request) -> tuple[dict | None, str | None]:
+    """POST and return ``(data, None)`` or ``(None, "HTTP <code>: <body>")``, retrying 429s
+    and refreshing an expired Nous key once on 401."""
+    is_nous = "nousresearch" in req.full_url
+    refreshed = False
+    for attempt in range(_MAX_RETRIES + 1):
+        if is_nous and NOUS_KEY:
+            req.add_header("Authorization", f"Bearer {NOUS_KEY}")  # always the current key
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read()), None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code == 401 and is_nous and not refreshed:
+                refreshed = True
+                print(f"  {GRAY}🔑 Nous key rejected (401) — refreshing and retrying{RESET}", flush=True)
+                if _refresh_nous_key():
+                    continue
+            if e.code == 429 and attempt < _MAX_RETRIES:
+                wait = _retry_wait(e, body, attempt)
+                print(f"  {GRAY}⏳ rate limited (429) — retrying in {wait:.0f}s ({attempt + 1}/{_MAX_RETRIES}){RESET}", flush=True)
+                time.sleep(wait)
+                continue
+            return None, f"HTTP {e.code}: {body[:200]}"
+    return None, "HTTP 429: retries exhausted"
+
+
 def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800,
               api_key: str = "", api_url: str = "", model: str = "") -> dict:
     """Raw API call returning the full choice dict (content, tool_calls, finish_reason, error)."""
@@ -186,8 +249,9 @@ def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800,
     payload = json.dumps(payload_dict).encode()
     req = urllib.request.Request(_url, data=payload, headers=_provider_headers(_key, _url), method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+        data, http_err = _post_json(req)
+        if http_err:
+            return {"content": None, "tool_calls": [], "finish": None, "error": http_err}
         if "choices" not in data:
             return {"content": None, "tool_calls": [], "finish": None, "error": str(data.get("error"))}
         choice = data["choices"][0]
@@ -198,9 +262,6 @@ def _call_api(system_prompt: str, user_content, *, tools=None, max_tokens=800,
             "finish": choice.get("finish_reason"),
             "error": None,
         }
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        return {"content": None, "tool_calls": [], "finish": None, "error": f"HTTP {e.code}: {body[:200]}"}
     except Exception as e:
         return {"content": None, "tool_calls": [], "finish": None, "error": str(e)}
 
@@ -222,16 +283,15 @@ def ask(system_prompt: str, user_msg: str, *,
 
     req = urllib.request.Request(_url, data=payload, headers=_provider_headers(_key, _url), method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-            msg = data["choices"][0]["message"]
-            content = msg.get("content")
-            if content is None:
-                return "[MODEL RAN OUT OF TOKENS IN THINKING PHASE]"
-            return content.strip()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        return f"[HTTP {e.code}] {body[:200]}"
+        data, http_err = _post_json(req)
+        if http_err:
+            code, _, body = http_err.partition(": ")
+            return f"[{code}] {body}"
+        msg = data["choices"][0]["message"]
+        content = msg.get("content")
+        if content is None:
+            return "[MODEL RAN OUT OF TOKENS IN THINKING PHASE]"
+        return content.strip()
     except Exception as e:
         return f"[ERROR] {e}"
 
@@ -330,7 +390,7 @@ def test_gif_tool(soul: str, *, api_key: str = "", api_url: str = "", model: str
         color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
         print(f"  {color}▶ [{status}] {note}{RESET}\n")
         results[status] += 1
-        time.sleep(0.5)
+        time.sleep(_CALL_DELAY)
 
     return results
 
@@ -371,7 +431,7 @@ def test_vision(soul: str, *, api_key: str = "", api_url: str = "", model: str =
     color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
     print(f"  {color}▶ [{status}] {note}{RESET}\n")
     results[status] += 1
-    time.sleep(0.5)
+    time.sleep(_CALL_DELAY)
 
     # (b) Text message mentioning image URL (Discord attachment pasted as text)
     r2 = _call_api(soul, f"what do you see in this pic? {_TEST_IMAGE_URL}", tools=_DISCORD_TOOLS,
@@ -398,7 +458,7 @@ def test_vision(soul: str, *, api_key: str = "", api_url: str = "", model: str =
     color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
     print(f"  {color}▶ [{status}] {note}{RESET}\n")
     results[status] += 1
-    time.sleep(0.5)
+    time.sleep(_CALL_DELAY)
 
     return results
 
@@ -446,7 +506,7 @@ def test_kill_slay(*, api_key: str = "", api_url: str = "", model: str = "") -> 
         color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
         print(f"  {color}▶ [{status}] {note}{RESET}\n")
         results[status] += 1
-        time.sleep(0.5)
+        time.sleep(_CALL_DELAY)
 
     print(f"  {GRAY}-- /slay --{RESET}")
     for name in slay_names:
@@ -469,7 +529,7 @@ def test_kill_slay(*, api_key: str = "", api_url: str = "", model: str = "") -> 
         color = GREEN if status == "PASS" else (YELLOW if status == "WARN" else RED)
         print(f"  {color}▶ [{status}] {note}{RESET}\n")
         results[status] += 1
-        time.sleep(0.5)
+        time.sleep(_CALL_DELAY)
 
     return results
 
@@ -483,6 +543,12 @@ def run_suite(soul: str, label: str, *,
 
     results: dict[str, int] = {"PASS": 0, "WARN": 0, "FAIL": 0}
     by_category: dict[str, list] = {}
+    # SOUL_TEST_ONLY=gif,vision runs a subset (persona, gif, vision, kill);
+    # SOUL_TEST_REPEAT=N repeats the gif + vision checks for a bigger sample.
+    only = {t.strip() for t in os.environ.get("SOUL_TEST_ONLY", "").split(",") if t.strip()}
+    want = lambda name: not only or name in only
+    repeat = max(1, int(os.environ.get("SOUL_TEST_REPEAT", "1")))
+    empty = {"PASS": 0, "WARN": 0, "FAIL": 0}
 
     # Probe with one call first — bail early if auth is stale
     probe = ask(soul, "yo", api_key=api_key, api_url=api_url, model=model)
@@ -493,7 +559,7 @@ def run_suite(soul: str, label: str, *,
                 "vision":   {"PASS": 0, "WARN": 0, "FAIL": 0},
                 "kill_slay": {"PASS": 0, "WARN": 0, "FAIL": 0}}
 
-    for category, msg in TEST_CASES:
+    for category, msg in (TEST_CASES if want("persona") else []):
         print(f"{CYAN}[{category}]{RESET} {BOLD}{msg}{RESET}")
         reply = ask(soul, msg, api_key=api_key, api_url=api_url, model=model)
         status, note = check_response(category, msg, reply)
@@ -506,7 +572,7 @@ def run_suite(soul: str, label: str, *,
 
         results[status] += 1
         by_category.setdefault(category, []).append(status)
-        time.sleep(0.5)
+        time.sleep(_CALL_DELAY)
 
     print("─" * 60)
     print(f"{BOLD}Persona Results:{RESET} {GREEN}{results['PASS']} PASS{RESET} | "
@@ -519,9 +585,17 @@ def run_suite(soul: str, label: str, *,
         color = GREEN if icon == "✓" else (RED if icon == "✗" else YELLOW)
         print(f"  {color}{icon}{RESET} {cat}: {statuses.count('PASS')}/{len(statuses)} pass")
 
-    gif_r    = test_gif_tool(soul, api_key=api_key, api_url=api_url, model=model)
-    vision_r = test_vision(soul, api_key=api_key, api_url=api_url, model=model)
-    kill_r   = test_kill_slay(api_key=api_key, api_url=api_url, model=model)  # plugin prompts on the model under test
+    def _repeat(fn) -> dict[str, int]:
+        total = dict(empty)
+        for _ in range(repeat):
+            for k, v in fn(soul, api_key=api_key, api_url=api_url, model=model).items():
+                total[k] += v
+        return total
+
+    gif_r    = _repeat(test_gif_tool) if want("gif") else dict(empty)
+    vision_r = _repeat(test_vision) if want("vision") else dict(empty)
+    kill_r   = (test_kill_slay(api_key=api_key, api_url=api_url, model=model)  # plugin prompts on the model under test
+                if want("kill") else dict(empty))
 
     return {"persona": results, "gif_tool": gif_r, "vision": vision_r, "kill_slay": kill_r}
 
@@ -540,7 +614,8 @@ def print_summary(label: str, all_results: dict[str, dict[str, int]]) -> None:
 
 
 def main():
-    if not API_KEY:
+    skip_openrouter = os.environ.get("SOUL_TEST_SKIP_OPENROUTER", "") in ("1", "true", "yes")
+    if not API_KEY and not skip_openrouter:
         print(f"{RED}OPENROUTER_API_KEY not set. Source ~/.hermes/.env first.{RESET}")
         sys.exit(1)
 
@@ -548,11 +623,11 @@ def main():
     print(f"{BOLD}Jenny SOUL.md Test Suite{RESET}")
     print(f"{GRAY}{len(TEST_CASES)} persona cases + GIF / Vision / Kill-Slay feature tests{RESET}")
 
-    providers = [
+    providers = [] if skip_openrouter else [
         (f"OpenRouter ({MODEL})", API_KEY, API_URL, MODEL),
     ]
     if NOUS_KEY and NOUS_API_URL:
-        print(f"\n{YELLOW}⚠ Nous agent_key expires quickly — run `hermes auth` right before this test for valid results.{RESET}")
+        _refresh_nous_key()  # start with a fresh ~1h key; _post_json renews again on 401
         # SOUL_TEST_NOUS_MODELS="a,b" compares several Nous models; default is the bot's configured model.
         nous_models = [m.strip() for m in os.environ.get("SOUL_TEST_NOUS_MODELS", "").split(",") if m.strip()] or [NOUS_MODEL]
         for nm in nous_models:
