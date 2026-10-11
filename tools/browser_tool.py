@@ -682,6 +682,34 @@ def _get_browser_engine() -> str:
     return _cached_browser_engine
 
 
+def _get_persistent_profile_dir() -> Optional[str]:
+    """Return the persistent Chrome profile directory path, if configured.
+
+    When set, agent-browser will use ``--profile <dir>`` so cookies, login
+    state, and localStorage survive across sessions and gateway restarts.
+
+    Priority:
+      1. ``AGENT_BROWSER_PROFILE_DIR`` env var
+      2. ``browser.profile_dir`` key in config.yaml
+
+    Creates the directory if it doesn't exist.  Returns None when not
+    configured so callers can skip the flag entirely.
+    """
+    path = os.environ.get("AGENT_BROWSER_PROFILE_DIR", "").strip()
+    if not path:
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config()
+            path = str(cfg.get("browser", {}).get("profile_dir") or "").strip()
+        except Exception:
+            pass
+    if not path:
+        return None
+    expanded = os.path.expanduser(path)
+    os.makedirs(expanded, exist_ok=True)
+    return expanded
+
+
 def _should_inject_engine(engine: str) -> bool:
     """Return True when the engine flag should be added to agent-browser commands.
 
@@ -855,6 +883,9 @@ def _run_chrome_fallback_command(
     else:
         cmd_prefix = [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
+    _fallback_profile = _get_persistent_profile_dir()
+    if _fallback_profile:
+        base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--profile", _fallback_profile, "--json"]
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
@@ -1962,6 +1993,13 @@ def _run_browser_command(
     engine = _engine_override or _get_browser_engine()
     if engine != "auto" and not _is_camofox_mode() and not session_info.get("cdp_url"):
         backend_args += ["--engine", engine]
+
+    # Persistent Chrome profile: reuse cookies / login state across sessions.
+    # Only applies to local mode — cloud (CDP/Browserbase) manages its own state.
+    if not session_info.get("cdp_url") and not _is_camofox_mode():
+        profile_dir = _get_persistent_profile_dir()
+        if profile_dir:
+            backend_args += ["--profile", profile_dir]
 
     # Keep concrete executable paths intact, even when they contain spaces.
     # Only the synthetic npx fallback needs to expand into multiple argv items.

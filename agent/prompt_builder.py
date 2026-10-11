@@ -410,6 +410,35 @@ COMPUTER_USE_GUIDANCE = (
     "force empty trash). You'll see an error if you try.\n"
 )
 
+# Guidance injected into the system prompt when browser tools are active.
+BROWSER_SOCIAL_MEDIA_GUIDANCE = (
+    "# Browser: Social Media Profile Browsing\n"
+    "When asked to find a post on X.com (Twitter) or other social media profiles:\n\n"
+    "**Finding the 'latest' / 'most recent' post:**\n"
+    "- Navigate directly to `https://x.com/<username>` — never use web_search to hunt "
+    "for specific posts.\n"
+    "- After navigating, call `browser_snapshot(full=true)` to capture all visible post "
+    "content including timestamps. Posts appear as `article` elements with dates like "
+    "'Sep 16, 2025'.\n"
+    "- The **most recent** post is the one with the largest (newest) date — do NOT pick "
+    "by engagement (likes/reposts). High-engagement posts are often older viral posts, "
+    "not the latest.\n"
+    "- X.com without login shows only a few posts. Scroll down once with browser_scroll "
+    "then re-snapshot to see if more posts loaded. Tell the user how many posts were "
+    "visible and whether you may have missed newer ones.\n"
+    "- If you can see image thumbnails in posts, use `vision_analyze` on their URLs to "
+    "describe them. The result includes a `saved_path` — use `MEDIA:<saved_path>` to "
+    "attach the actual image to your reply.\n\n"
+    "**Finding the 'first' / 'earliest' / 'oldest' post:**\n"
+    "- This means the chronologically OLDEST post, not the most recent. X.com without "
+    "login cannot scroll all the way back to 2021+ account origins — tell the user you "
+    "can only see recent posts and show the oldest date visible.\n\n"
+    "**General social media browsing:**\n"
+    "- Always compare post **dates** to determine recency, not engagement metrics.\n"
+    "- If the page shows a login wall ('Don't miss what's happening'), some posts may "
+    "still be visible below it — use browser_snapshot(full=true) to see them.\n"
+)
+
 # Model name substrings that should use the 'developer' role instead of
 # 'system' for the system prompt.  OpenAI's newer models (GPT-5, Codex)
 # give stronger instruction-following weight to the 'developer' role.

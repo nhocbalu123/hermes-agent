@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    BROWSER_SOCIAL_MEDIA_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -126,6 +127,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "computer_use" in agent.valid_tool_names:
         from agent.prompt_builder import COMPUTER_USE_GUIDANCE
         stable_parts.append(COMPUTER_USE_GUIDANCE)
+
+    # Browser social-media guidance — only when browser tools are present.
+    if "browser_navigate" in agent.valid_tool_names:
+        stable_parts.append(BROWSER_SOCIAL_MEDIA_GUIDANCE)
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:
