@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _CLIENT_NAME = "hermes-agent"
 
-_SEARCH_PAYLOAD = {"include_raw_content": False, "include_images": False}
+_SEARCH_PAYLOAD = {"include_raw_content": False, "include_images": True}
 
 
 def _tavily_headers(api_key: str) -> Dict[str, str]:
@@ -51,10 +51,20 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any], *, api_key: Optional
 
 
 def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]:
-    return search_ok([
+    """``{success, data: {web: [...]}}`` plus ``data.images`` when Tavily returned image URLs."""
+    result = search_ok([
         title_hit(r.get("title", ""), r.get("url", ""), r.get("content", ""), i + 1)
         for i, r in enumerate(response.get("results", []))
     ])
+    images = []
+    for img in response.get("images", None) or []:
+        if isinstance(img, str) and img:
+            images.append({"url": img})
+        elif isinstance(img, dict) and img.get("url"):
+            images.append({"url": img["url"], "description": img.get("description", "")})
+    if images:
+        result["data"]["images"] = images
+    return result
 
 
 def _normalize_tavily_documents(response: Dict[str, Any]) -> List[Dict[str, Any]]:
