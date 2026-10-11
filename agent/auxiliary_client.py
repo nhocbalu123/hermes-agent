@@ -3286,6 +3286,21 @@ def resolve_provider_client(
                 model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
                 provider,
             )
+            # When the custom base URL is actually a native Gemini endpoint
+            # (e.g. generativelanguage.googleapis.com), route through
+            # GeminiNativeClient so requests use Gemini's REST format instead
+            # of the OpenAI-compat path that returns 500 for image/vision calls.
+            from agent.gemini_native_adapter import GeminiNativeClient as _GNC, is_native_gemini_base_url as _is_ngbu
+            if _is_ngbu(custom_base):
+                _gkey = (
+                    (explicit_api_key or "").strip()
+                    or os.getenv("GOOGLE_API_KEY", "").strip()
+                )
+                if _gkey:
+                    _gclient = _GNC(api_key=_gkey, base_url=custom_base)
+                    logger.debug("resolve_provider_client: custom→native-gemini (%s)", final_model)
+                    return (_to_async_client(_gclient, final_model, is_vision=is_vision) if async_mode
+                            else (_gclient, final_model))
             extra = {}
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:

@@ -32,6 +32,7 @@ import base64
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -46,6 +47,24 @@ import sys
 logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+
+_last_vision_download_cleanup: Dict[str, float] = {}
+
+
+def _cleanup_old_vision_downloads(save_dir: Path, max_age_hours: int = 24) -> None:
+    """Remove vision_downloaded_* files older than max_age_hours (throttled to 1/hour)."""
+    key = str(save_dir)
+    now = time.time()
+    if now - _last_vision_download_cleanup.get(key, 0.0) < 3600:
+        return
+    _last_vision_download_cleanup[key] = now
+    cutoff = now - (max_age_hours * 3600)
+    for f in save_dir.glob("vision_downloaded_*.jpg"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except Exception as exc:
+            logger.debug("Failed to clean old vision download %s: %s", f, exc)
 
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
@@ -571,10 +590,12 @@ async def _vision_analyze_native(
             blocked = check_website_access(image_url)
             if blocked:
                 return tool_error(blocked["message"], success=False)
-            temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-            temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
+            save_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            _cleanup_old_vision_downloads(save_dir)
+            temp_image_path = save_dir / f"vision_downloaded_{uuid.uuid4().hex}.jpg"
             await _download_image(image_url, temp_image_path)
-            should_cleanup = True
+            should_cleanup = False  # Keep so model can deliver via MEDIA:<saved_path>
         else:
             return tool_error(
                 "Invalid image source. Provide an HTTP/HTTPS URL or a "
@@ -610,12 +631,21 @@ async def _vision_analyze_native(
                     success=False,
                 )
 
-        return _build_native_vision_tool_result(
+        result = _build_native_vision_tool_result(
             image_url=image_url,
             question=question,
             image_data_url=image_data_url,
             image_size_bytes=image_size_bytes,
         )
+        # Expose the local path so the model can deliver the image via MEDIA:<saved_path>
+        if temp_image_path is not None and not should_cleanup and temp_image_path.exists():
+            saved_path = str(temp_image_path)
+            result["meta"]["saved_path"] = saved_path
+            if result.get("content") and result["content"][0].get("type") == "text":
+                result["content"][0]["text"] += (
+                    f"\n\nsaved_path: {saved_path} — use MEDIA:<saved_path> to share this image with the user."
+                )
+        return result
 
     except Exception as exc:
         logger.warning("Native vision fast path failed: %s", exc)
@@ -708,15 +738,17 @@ async def vision_analyze_tool(
             temp_image_path = local_path
             should_cleanup = False  # Don't delete cached/local files
         elif _validate_image_url(image_url):
-            # Remote URL -- download to a temporary location
+            # Remote URL -- download and persist so the model can share it via MEDIA:
             blocked = check_website_access(image_url)
             if blocked:
                 raise PermissionError(blocked["message"])
             logger.info("Downloading image from URL...")
-            temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-            temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
+            save_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            _cleanup_old_vision_downloads(save_dir)
+            temp_image_path = save_dir / f"vision_downloaded_{uuid.uuid4().hex}.jpg"
             await _download_image(image_url, temp_image_path)
-            should_cleanup = True
+            should_cleanup = False  # Keep so model can deliver via MEDIA:<saved_path>
         else:
             raise ValueError(
                 "Invalid image source. Provide an HTTP/HTTPS URL or a valid local file path."
@@ -838,10 +870,13 @@ async def vision_analyze_tool(
         logger.info("Image analysis completed (%s characters)", analysis_length)
         
         # Prepare successful response
-        result = {
+        result: Dict[str, Any] = {
             "success": True,
-            "analysis": analysis or "There was a problem with the request and the image could not be analyzed."
+            "analysis": analysis or "There was a problem with the request and the image could not be analyzed.",
         }
+        # Expose the local path so the model can deliver the image via MEDIA:<saved_path>
+        if temp_image_path is not None and not should_cleanup and temp_image_path.exists():
+            result["saved_path"] = str(temp_image_path)
         
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
@@ -1007,7 +1042,10 @@ VISION_ANALYZE_SCHEMA = {
         "any time the user references an image (filepath in their message, "
         "URL in tool output, screenshot from the browser, etc.). For "
         "non-vision models, falls back to an auxiliary vision model that "
-        "returns a text description."
+        "returns a text description. When the input is a remote URL, the "
+        "result includes a `saved_path` field with the local file path — "
+        "use MEDIA:<saved_path> in your response to share that image with "
+        "the user."
     ),
     "parameters": {
         "type": "object",

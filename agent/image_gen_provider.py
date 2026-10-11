@@ -163,10 +163,17 @@ def resolve_aspect_ratio(value: Optional[str]) -> str:
 
 
 def _images_cache_dir() -> Path:
-    """Return ``$HERMES_HOME/cache/images/``, creating parents as needed."""
-    from hermes_constants import get_hermes_home
+    """Return the image cache directory, creating it as needed.
 
-    path = get_hermes_home() / "cache" / "images"
+    Uses the same path-resolution logic as ``gateway/platforms/base.py``'s
+    ``IMAGE_CACHE_DIR`` so that generated images always land in a directory
+    that is already on the media-delivery safe-roots list:
+    - legacy ``$HERMES_HOME/image_cache/`` if it exists (profile installs)
+    - otherwise ``$HERMES_HOME/cache/images/`` (new layout)
+    """
+    from hermes_constants import get_hermes_dir
+
+    path = get_hermes_dir("cache/images", "image_cache")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
