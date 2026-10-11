@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import types as _types
 import struct
 import subprocess
 import tempfile
@@ -66,6 +67,38 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from tools.url_safety import is_safe_url
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# CDNs that require a same-domain Referer to serve hotlinked images.
+_REFERER_MAP = {
+    "i.pinimg.com": "https://www.pinterest.com/",
+    "pinimg.com": "https://www.pinterest.com/",
+    "giphy.com": "https://giphy.com/",
+}
+
+
+def _image_download_headers(url: str) -> dict:
+    """Return browser-like headers for an image download request.
+
+    Pinterest and similar CDNs block requests without a Referer from their
+    own domain. We also send a real User-Agent to avoid generic bot blocks.
+    """
+    headers = {"User-Agent": _BROWSER_UA}
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        for domain, referer in _REFERER_MAP.items():
+            if host == domain or host.endswith("." + domain):
+                headers["Referer"] = referer
+                break
+    except Exception:
+        pass
+    return headers
 
 
 def _clean_discord_id(entry: str) -> str:
@@ -1704,6 +1737,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             files: List[Any] = []
             captions: List[str] = []
+            fallback_urls: List[str] = []
             aiohttp_session = None
             try:
                 for image_url, alt_text in chunk:
@@ -1728,13 +1762,17 @@ class DiscordAdapter(BasePlatformAdapter):
                             if aiohttp_session is None:
                                 aiohttp_session = _aiohttp.ClientSession(**_sess_kw)
                             async with aiohttp_session.get(
-                                image_url, timeout=_aiohttp.ClientTimeout(total=30), **_req_kw,
+                                image_url,
+                                timeout=_aiohttp.ClientTimeout(total=30),
+                                headers=_image_download_headers(image_url),
+                                **_req_kw,
                             ) as resp:
                                 if resp.status != 200:
                                     logger.warning(
                                         "[%s] Failed to download image (HTTP %d) in batch: %s",
                                         self.name, resp.status, image_url[:80],
                                     )
+                                    fallback_urls.append(image_url)
                                     continue
                                 data = await resp.read()
                                 ct = resp.headers.get("content-type", "image/png")
@@ -1748,9 +1786,15 @@ class DiscordAdapter(BasePlatformAdapter):
                                 files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            fallback_urls.append(image_url)
                             continue
 
                 if not files:
+                    for fb_url in fallback_urls:
+                        try:
+                            await channel.send(content=fb_url)
+                        except Exception as fb_err:
+                            logger.warning("[%s] Fallback URL send failed: %s", self.name, fb_err)
                     continue
 
                 # Use the first caption if any (Discord only has one message body for the group)
@@ -1768,6 +1812,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                 else:
                     await channel.send(content=content, files=files)
+
+                # URLs that couldn't be downloaded — send as plain text so
+                # Discord can at least show an embed/preview.
+                for fb_url in fallback_urls:
+                    try:
+                        await channel.send(content=fb_url)
+                    except Exception as fb_err:
+                        logger.warning("[%s] Fallback URL send failed: %s", self.name, fb_err)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -2551,7 +2603,12 @@ class DiscordAdapter(BasePlatformAdapter):
             _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
             async with aiohttp.ClientSession(**_sess_kw) as session:
-                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30), **_req_kw) as resp:
+                async with session.get(
+                    image_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers=_image_download_headers(image_url),
+                    **_req_kw,
+                ) as resp:
                     if resp.status != 200:
                         raise Exception(f"Failed to download image: HTTP {resp.status}")
 
@@ -3779,15 +3836,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     continue
 
-                # Respect DISCORD_ALLOW_BOTS for other bots.
-                # For history context, "mentions" is treated as "all" — we are
-                # deciding what context to show, not whether to respond.
-                if getattr(msg.author, "bot", False) and not include_other_bots:
-                    continue
+                # Always include bot messages in history context regardless of
+                # DISCORD_ALLOW_BOTS — bots like ESMBot post GIF/video conversions
+                # that users refer to in their next message. Filtering them here
+                # would make the agent blind to media that was just posted.
+                # (DISCORD_ALLOW_BOTS still controls whether we *respond* to bot
+                # messages; this block is read-only context, not a trigger.)
 
                 content = getattr(msg, "clean_content", msg.content) or ""
-                if not content and msg.attachments:
-                    content = "(attachment)"
+                if not content or msg.attachments or (getattr(msg, "embeds", None)):
+                    # Collect attachment URLs (images, GIFs, videos) so the model
+                    # can call vision_analyze on them when the user refers to them.
+                    media_urls_in_msg = []
+                    for _a in (msg.attachments or []):
+                        if _a.url:
+                            media_urls_in_msg.append(_a.url)
+                    for _e in (getattr(msg, "embeds", None) or []):
+                        _eu = getattr(_e, "url", None) or (
+                            getattr(getattr(_e, "image", None), "url", None)
+                            or getattr(getattr(_e, "video", None), "url", None)
+                        )
+                        if _eu and _eu not in media_urls_in_msg:
+                            media_urls_in_msg.append(_eu)
+                    if media_urls_in_msg:
+                        media_note = "(media: " + " ".join(media_urls_in_msg) + ")"
+                        content = f"{content} {media_note}".strip() if content else media_note
                 if not content:
                     continue
 
@@ -4564,7 +4637,57 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
 
-        all_attachments = list(message.attachments) + snapshot_attachments
+        # Resolve the message being replied to early, so attachments from the
+        # replied message can be passed into Hermes vision/media handling.
+        reply_to_id = None
+        reply_to_text = None
+        reply_attachments = []
+
+        if message.reference:
+            reply_to_id = str(message.reference.message_id) if message.reference.message_id else None
+            ref_msg = getattr(message.reference, "resolved", None)
+
+            # Discord does not always include the referenced message in the
+            # gateway event, so fetch it when needed.
+            if ref_msg is None and reply_to_id and self._client:
+                try:
+                    ref_channel_id = (
+                        getattr(message.reference, "channel_id", None)
+                        or getattr(message.channel, "id", None)
+                    )
+                    ref_channel = self._client.get_channel(int(ref_channel_id))
+                    if ref_channel is None:
+                        ref_channel = await self._client.fetch_channel(int(ref_channel_id))
+                    ref_msg = await ref_channel.fetch_message(int(reply_to_id))
+                except Exception as e:
+                    logger.debug(
+                        "[%s] Could not fetch replied Discord message %s: %s",
+                        self.name,
+                        reply_to_id,
+                        e,
+                    )
+
+            if ref_msg is not None:
+                reply_to_text = getattr(ref_msg, "content", None) or None
+                reply_attachments = list(getattr(ref_msg, "attachments", []) or [])
+                # Also collect images from embeds on the referenced message.
+                # Linked images (not direct uploads) are stored as embeds, not
+                # attachments — without this, replying to a linked image gives
+                # the bot no visual context.
+                for _embed in (getattr(ref_msg, "embeds", None) or []):
+                    _etype = getattr(_embed, "type", None)
+                    _img_url = None
+                    if _etype in ("image", "gifv"):
+                        _img_url = getattr(_embed, "url", None)
+                    elif _etype == "rich":
+                        _img_field = getattr(_embed, "image", None) or getattr(_embed, "thumbnail", None)
+                        _img_url = getattr(_img_field, "url", None) if _img_field else None
+                    if _img_url:
+                        _ext = os.path.splitext(_img_url.split("?")[0])[-1].lower()
+                        _ct = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(_ext, "image/jpeg")
+                        reply_attachments.append(_types.SimpleNamespace(url=_img_url, content_type=_ct, filename=None, size=None))
+
+        all_attachments = list(message.attachments) + snapshot_attachments + reply_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -4803,13 +4926,6 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
-
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
         event = MessageEvent(
             text=event_text,

@@ -2111,7 +2111,13 @@ class BasePlatformAdapter(ABC):
         for match in re.finditer(html_pattern, content):
             url = match.group(1)
             images.append((url, ""))
-        
+
+        # Match bare GIF URLs on their own line (e.g. direct Giphy CDN URLs from terminal output)
+        bare_gif_pattern = r'(?m)^[ \t]*(https?://\S+\.gif)[ \t]*$'
+        for match in re.finditer(bare_gif_pattern, content):
+            url = match.group(1)
+            images.append((url, ""))
+
         # Remove only the matched image tags from content (not all markdown images)
         if images:
             extracted_urls = {url for url, _ in images}
@@ -2120,6 +2126,7 @@ class BasePlatformAdapter(ABC):
                 return '' if url in extracted_urls else match.group(0)
             cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
             cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
+            cleaned = re.sub(bare_gif_pattern, lambda m: '' if m.group(1) in extracted_urls else m.group(0), cleaned)
             # Clean up leftover blank lines
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
@@ -2243,7 +2250,7 @@ class BasePlatformAdapter(ABC):
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                logger.warning("Skipping unsafe MEDIA directive path outside allowed roots")
+                logger.warning("Skipping unsafe MEDIA directive path outside allowed roots: %s", media_path)
         return safe_media
 
     @staticmethod

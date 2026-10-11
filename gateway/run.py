@@ -68,7 +68,7 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
+    r"("  # transient/auxiliary status that should stay in logs, not chat
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
@@ -81,6 +81,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
+    r"|empty\s+response\s+from\s+model\s+.{0,10}retrying"
+    r"|interrupting\s+current\s+task"
+    r"|queued\s+for\s+the\s+next\s+turn"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
@@ -302,12 +305,15 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+_NOISY_STATUS_PLATFORMS = frozenset({"telegram", "discord"})
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery."""
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_platform_value(platform) not in _NOISY_STATUS_PLATFORMS:
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
@@ -8687,6 +8693,68 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+
+            # Append a Jenny-voiced tool-usage footer when tools were used this turn.
+            # Only scan messages added during this turn (agent_messages[len(history):])
+            # so that tool calls from earlier conversation turns are not re-announced.
+            _current_turn_messages = agent_messages[len(history):]
+            if response and _current_turn_messages:
+                _used_tool_names: list[str] = []
+                _seen_tool_ids: set[str] = set()
+                for _msg in _current_turn_messages:
+                    _tcs = None
+                    if hasattr(_msg, "tool_calls") and isinstance(_msg.tool_calls, list):
+                        _tcs = _msg.tool_calls
+                    elif isinstance(_msg, dict) and isinstance(_msg.get("tool_calls"), list):
+                        _tcs = _msg["tool_calls"]
+                    if not _tcs:
+                        continue
+                    for _tc in _tcs:
+                        _tc_id = None
+                        _tc_name = None
+                        if hasattr(_tc, "id") and hasattr(_tc, "function"):
+                            _tc_id = _tc.id
+                            _tc_name = getattr(_tc.function, "name", None)
+                        elif isinstance(_tc, dict):
+                            _tc_id = _tc.get("id")
+                            _fn = _tc.get("function") or {}
+                            _tc_name = _fn.get("name") if isinstance(_fn, dict) else None
+                        if _tc_name and _tc_id not in _seen_tool_ids:
+                            _used_tool_names.append(_tc_name)
+                            if _tc_id:
+                                _seen_tool_ids.add(_tc_id)
+                if _used_tool_names:
+                    _unique_tools = list(dict.fromkeys(_used_tool_names))
+                    _TOOL_PHRASES = {
+                        "web_search": "looked that up~",
+                        "web_extract": "peeked at a page for you~",
+                        "terminal": "ran a command real quick~",
+                        "read_file": "read a file~",
+                        "write_file": "wrote to a file~",
+                        "patch": "edited a file~",
+                        "search_files": "searched through some files~",
+                        "vision_analyze": "took a look at that image~",
+                        "image_generate": "made an image for you~",
+                        "browser_navigate": "opened a browser~",
+                        "browser_snapshot": "took a browser screenshot~",
+                        "browser_click": "clicked something in the browser~",
+                        "browser_type": "typed something in the browser~",
+                        "browser_scroll": "scrolled around~",
+                        "execute_code": "ran some code~",
+                        "delegate_task": "asked a helper agent~",
+                        "memory": "checked my memories~",
+                        "todo": "checked the todo list~",
+                        "text_to_speech": "made some audio~",
+                        "session_search": "looked through our old chats~",
+                    }
+                    _phrases = [_TOOL_PHRASES.get(t, f"used {t}~") for t in _unique_tools]
+                    if len(_phrases) == 1:
+                        _footer = f"({_phrases[0]})"
+                    elif len(_phrases) == 2:
+                        _footer = f"({_phrases[0]} and {_phrases[1]})"
+                    else:
+                        _footer = f"({', '.join(_phrases[:-1])}, and {_phrases[-1]})"
+                    response = f"{response}\n{_footer}"
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
