@@ -46,6 +46,8 @@ class TurnRetryState:
     affordable_402_clamp_attempted: bool = False
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
+    # Short Retry-After 429s waited out on the primary instead of eagerly falling back (cap 5).
+    rate_limit_waits: int = 0
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
 

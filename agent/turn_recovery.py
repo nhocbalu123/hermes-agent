@@ -1935,6 +1935,15 @@ def route_classified_error(
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     )
+    if _should_fallback and is_rate_limited and _retry.rate_limit_waits < 5:
+        # A 429 with a short Retry-After (e.g. Groq per-minute token windows, <=60s) is cheaper to
+        # wait out than abandoning the primary model; compute_error_backoff honours the header.
+        # Capped so a stuck quota still eventually falls back.
+        from agent.retry_utils import provider_retry_after_seconds
+        _ra_s = provider_retry_after_seconds(api_error)
+        if _ra_s is not None and 0 < _ra_s <= 120:
+            _retry.rate_limit_waits += 1
+            _should_fallback = False
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.
