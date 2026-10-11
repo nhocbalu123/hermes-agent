@@ -1567,6 +1567,68 @@ class GatewayTurnMixin:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
+            # Append a Jenny-voiced tool-usage footer when tools were used this turn.
+            # Only scan messages added during this turn (history_offset is what the agent saw, which
+            # differs from len(history) after in-place compaction) so earlier tool calls are not re-announced.
+            _current_turn_messages = agent_messages[agent_result.get("history_offset", len(history)):]
+            if response and _current_turn_messages:
+                _used_tool_names: list[str] = []
+                _seen_tool_ids: set[str] = set()
+                for _msg in _current_turn_messages:
+                    _tcs = None
+                    if hasattr(_msg, "tool_calls") and isinstance(_msg.tool_calls, list):
+                        _tcs = _msg.tool_calls
+                    elif isinstance(_msg, dict) and isinstance(_msg.get("tool_calls"), list):
+                        _tcs = _msg["tool_calls"]
+                    if not _tcs:
+                        continue
+                    for _tc in _tcs:
+                        _tc_id = None
+                        _tc_name = None
+                        if hasattr(_tc, "id") and hasattr(_tc, "function"):
+                            _tc_id = _tc.id
+                            _tc_name = getattr(_tc.function, "name", None)
+                        elif isinstance(_tc, dict):
+                            _tc_id = _tc.get("id")
+                            _fn = _tc.get("function") or {}
+                            _tc_name = _fn.get("name") if isinstance(_fn, dict) else None
+                        if _tc_name and _tc_id not in _seen_tool_ids:
+                            _used_tool_names.append(_tc_name)
+                            if _tc_id:
+                                _seen_tool_ids.add(_tc_id)
+                if _used_tool_names:
+                    _unique_tools = list(dict.fromkeys(_used_tool_names))
+                    _TOOL_PHRASES = {
+                        "web_search": "looked that up~",
+                        "web_extract": "peeked at a page for you~",
+                        "terminal": "ran a command real quick~",
+                        "read_file": "read a file~",
+                        "write_file": "wrote to a file~",
+                        "patch": "edited a file~",
+                        "search_files": "searched through some files~",
+                        "vision_analyze": "took a look at that image~",
+                        "image_generate": "made an image for you~",
+                        "browser_navigate": "opened a browser~",
+                        "browser_snapshot": "took a browser screenshot~",
+                        "browser_click": "clicked something in the browser~",
+                        "browser_type": "typed something in the browser~",
+                        "browser_scroll": "scrolled around~",
+                        "execute_code": "ran some code~",
+                        "delegate_task": "asked a helper agent~",
+                        "memory": "checked my memories~",
+                        "todo": "checked the todo list~",
+                        "text_to_speech": "made some audio~",
+                        "session_search": "looked through our old chats~",
+                    }
+                    _phrases = [_TOOL_PHRASES.get(t, f"used {t}~") for t in _unique_tools]
+                    if len(_phrases) == 1:
+                        _footer = f"({_phrases[0]})"
+                    elif len(_phrases) == 2:
+                        _footer = f"({_phrases[0]} and {_phrases[1]})"
+                    else:
+                        _footer = f"({', '.join(_phrases[:-1])}, and {_phrases[-1]})"
+                    response = f"{response}\n{_footer}"
+
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:

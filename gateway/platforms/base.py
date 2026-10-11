@@ -3070,6 +3070,9 @@ class BasePlatformAdapter(ABC):
                   if any(m.group(2).lower().endswith(ext) or ext in m.group(2).lower()
                          for ext in markers)]
         images.extend((match.group(1), "") for match in re.finditer(html_pattern, content))
+        # Match bare GIF URLs on their own line (e.g. direct Giphy CDN URLs from terminal output)
+        bare_gif_pattern = r'(?m)^[ \t]*(https?://\S+\.gif)[ \t]*$'
+        images.extend((match.group(1), "") for match in re.finditer(bare_gif_pattern, content))
         if not images:
             return images, content
         # Remove only the tags we extracted, not every markdown image.
@@ -3079,7 +3082,7 @@ class BasePlatformAdapter(ABC):
             url = match.group(2) if match.lastindex >= 2 else match.group(1)
             return '' if url in extracted_urls else match.group(0)
         cleaned = content
-        for pattern in (md_pattern, html_pattern):
+        for pattern in (md_pattern, html_pattern, bare_gif_pattern):
             cleaned = re.sub(pattern, _remove_if_extracted, cleaned)
         return images, re.sub(r'\n{3,}', '\n\n', cleaned).strip()  # leftover blank lines
 

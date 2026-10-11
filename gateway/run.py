@@ -103,6 +103,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     rf"|{re.escape(COMPACTION_DONE_STATUS)}"
+    r"|empty\s+response\s+from\s+model\s+.{0,10}retrying"
+    r"|interrupting\s+current\s+task"
+    r"|queued\s+for\s+the\s+next\s+turn"
     r")",
     re.IGNORECASE | re.DOTALL)
 

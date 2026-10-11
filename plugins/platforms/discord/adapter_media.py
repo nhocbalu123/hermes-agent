@@ -128,6 +128,18 @@ class DiscordMediaMixin:
         return SendResult(success=True, message_id=str(msg.id))
 
 
+    async def _send_fallback_urls(self, channel: Any, urls: List[str]) -> bool:
+        """Post image URLs that failed to download (e.g. Giphy CDN 404) as plain text so Discord
+        auto-embeds them instead of silently dropping them. Returns True if any were sent."""
+        sent = False
+        for url in urls:
+            try:
+                await channel.send(content=url)
+                sent = True
+            except Exception as fb_err:
+                logger.warning("[%s] Fallback URL send failed: %s", self.name, fb_err)
+        return sent
+
     async def send_multiple_images(
         self, chat_id: str, images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0,
@@ -163,6 +175,7 @@ class DiscordMediaMixin:
             files: List[Any] = []
             captions: List[str] = []
             skip_notices: List[str] = []
+            fallback_urls: List[str] = []
             aiohttp_session = None
             try:
                 for image_url, alt_text in chunk:
@@ -219,13 +232,18 @@ class DiscordMediaMixin:
                                     "[%s] Failed to download image (HTTP %d) in batch: %s",
                                     self.name, status, image_url[:80],
                                 )
+                                fallback_urls.append(image_url)
                                 continue
                             ext = _image_ext_from_content_type(headers.get("content-type", "image/png"))
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            fallback_urls.append(image_url)
                             continue
                 if not files:
+                    # URLs that couldn't be downloaded: send as plain text so Discord can still embed them.
+                    if await self._send_fallback_urls(channel, fallback_urls):
+                        delivered = True
                     # Everything in this chunk was skipped. Still surface any
                     # oversized-file notices so the drop is not silent.
                     shown = self.warning_notifications_enabled()
@@ -258,6 +276,7 @@ class DiscordMediaMixin:
                 else:
                     await channel.send(content=content, files=files)
                 delivered = True
+                await self._send_fallback_urls(channel, fallback_urls)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",

@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types as _types
 from collections import defaultdict
 from contextlib import nullcontext, suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -314,6 +315,38 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# CDNs that require a same-domain Referer to serve hotlinked images.
+_REFERER_MAP = {
+    "i.pinimg.com": "https://www.pinterest.com/",
+    "pinimg.com": "https://www.pinterest.com/",
+    "giphy.com": "https://giphy.com/",
+}
+
+
+def _image_download_headers(url: str) -> dict:
+    """Return browser-like headers for an image download request.
+
+    Pinterest and similar CDNs block requests without a Referer from their
+    own domain. We also send a real User-Agent to avoid generic bot blocks.
+    """
+    headers = {"User-Agent": _BROWSER_UA}
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        for domain, referer in _REFERER_MAP.items():
+            if host == domain or host.endswith("." + domain):
+                headers["Referer"] = referer
+                break
+    except Exception:
+        pass
+    return headers
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal, env_is_connected as _env_is_connected,
     extra_or_secret as _extra_or_secret, platform_gate_env as _scoped_gate_env, send_error,
@@ -336,8 +369,10 @@ async def _read_url_image_with_redirect_guard(
     for _ in range(_DISCORD_IMAGE_MAX_REDIRECTS + 1):
         if not is_safe_url(current_url):
             raise ValueError("Blocked unsafe image URL redirect")
+        _kw = dict(request_kwargs)
+        _kw.setdefault("headers", _image_download_headers(current_url))
         async with session.get(
-            current_url, timeout=timeout, allow_redirects=False, **request_kwargs,
+            current_url, timeout=timeout, allow_redirects=False, **_kw,
         ) as resp:
             raw_headers = getattr(resp, "headers", {}) or {}
             headers = {str(key).lower(): value for key, value in dict(raw_headers).items()}
@@ -5275,8 +5310,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         limit = self._discord_history_backfill_limit()
         if limit <= 0:
             return ""
-        allow_bots_raw = self._get_allow_bots()
-        include_other_bots = allow_bots_raw != "none"
         # Narrow via cached last-self-message id (`after`) only if it predates the trigger; miss => full scan.
         channel_id = str(getattr(channel, "id", ""))
         _cached_id = self._last_self_message_id.get(channel_id)
@@ -5301,12 +5334,27 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     or _looks_like_nonconversational_history_message(content)
                 ):
                     return None
-                # DISCORD_ALLOW_BOTS: for history, "mentions" counts as "all" (context, not response).
+                # Always include other bots' messages in history context regardless of
+                # DISCORD_ALLOW_BOTS: bots like ESMBot post GIF/video conversions that users
+                # refer to next. DISCORD_ALLOW_BOTS still controls whether we *respond* to bots.
                 is_bot_author = getattr(msg.author, "bot", False)
-                if (is_bot_author and msg.author != self._client.user and not include_other_bots):
-                    return None
-                if not content and msg.attachments:
-                    content = "(attachment)"
+                if not content or msg.attachments or getattr(msg, "embeds", None):
+                    # Collect attachment/embed URLs (images, GIFs, videos) so the model
+                    # can call vision_analyze on them when the user refers to them.
+                    media_urls_in_msg = []
+                    for _a in (msg.attachments or []):
+                        if _a.url:
+                            media_urls_in_msg.append(_a.url)
+                    for _e in (getattr(msg, "embeds", None) or []):
+                        _eu = getattr(_e, "url", None) or (
+                            getattr(getattr(_e, "image", None), "url", None)
+                            or getattr(getattr(_e, "video", None), "url", None)
+                        )
+                        if _eu and _eu not in media_urls_in_msg:
+                            media_urls_in_msg.append(_eu)
+                    if media_urls_in_msg:
+                        media_note = "(media: " + " ".join(media_urls_in_msg) + ")"
+                        content = f"{content} {media_note}".strip() if content else media_note
                 if not content:
                     return None
                 name = (
@@ -6250,11 +6298,41 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             notify_error,
                         )
                     return False
+        # Resolve the replied-to message early so its attachments (and embed images) reach vision.
         referenced_attachments = []
+        reply_to_id = None
+        reply_to_text = None
         reference = getattr(message, "reference", None)
-        resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None:
-            referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
+        if reference:
+            reply_to_id = str(reference.message_id) if reference.message_id else None
+            resolved_reference = getattr(reference, "resolved", None)
+            # Discord does not always include the referenced message in the gateway event.
+            if resolved_reference is None and reply_to_id and self._client:
+                try:
+                    ref_channel_id = getattr(reference, "channel_id", None) or getattr(message.channel, "id", None)
+                    ref_channel = self._client.get_channel(int(ref_channel_id))
+                    if ref_channel is None:
+                        ref_channel = await self._client.fetch_channel(int(ref_channel_id))
+                    resolved_reference = await ref_channel.fetch_message(int(reply_to_id))
+                except Exception as e:
+                    logger.debug("[%s] Could not fetch replied Discord message %s: %s", self.name, reply_to_id, e)
+            if resolved_reference is not None:
+                reply_to_text = getattr(resolved_reference, "content", None) or None
+                referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
+                # Linked images (not uploads) arrive as embeds, not attachments.
+                for _embed in (getattr(resolved_reference, "embeds", None) or []):
+                    _etype = getattr(_embed, "type", None)
+                    _img_url = None
+                    if _etype in ("image", "gifv"):
+                        _img_url = getattr(_embed, "url", None)
+                    elif _etype == "rich":
+                        _img_field = getattr(_embed, "image", None) or getattr(_embed, "thumbnail", None)
+                        _img_url = getattr(_img_field, "url", None) if _img_field else None
+                    if _img_url:
+                        _ext = os.path.splitext(_img_url.split("?")[0])[-1].lower()
+                        _ct = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(_ext, "image/jpeg")
+                        referenced_attachments.append(
+                            _types.SimpleNamespace(url=_img_url, content_type=_ct, filename=None, size=None))
         all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
         if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
@@ -6335,12 +6413,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
