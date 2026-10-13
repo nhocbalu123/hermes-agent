@@ -875,7 +875,10 @@ class GeminiNativeClient:
         url = f"{self.base_url}/models/{model}:"
         if stream:
             return self._stream_completion(model, f"{url}{self.STREAM_METHOD}?alt=sse", request, timeout)
-        response = self._http.post(url + self.GENERATE_METHOD, json=request, headers=self._headers(), timeout=timeout)
+        # Fork: timeout=None would disable httpx timeouts entirely (a dropped stream hung a cron job for hours);
+        # only override the client's default timeouts when the caller actually set one.
+        timeout_kw = {} if timeout is None else {"timeout": timeout}
+        response = self._http.post(url + self.GENERATE_METHOD, json=request, headers=self._headers(), **timeout_kw)
         if response.status_code != 200:
             raise self._http_error(response)
         try:
@@ -889,7 +892,8 @@ class GeminiNativeClient:
     def _stream_completion(self, model: str, url: str, request: Dict[str, Any], timeout: Any) -> Iterator[_GeminiStreamChunk]:
         try:
             headers = {**self._headers(), "Accept": "text/event-stream"}
-            with self._http.stream("POST", url, json=request, headers=headers, timeout=timeout) as response:
+            timeout_kw = {} if timeout is None else {"timeout": timeout}
+            with self._http.stream("POST", url, json=request, headers=headers, **timeout_kw) as response:
                 if response.status_code != 200:
                     raise self._http_error(response, read_streaming_error_body(response))
                 tool_call_indices: Dict[str, Dict[str, Any]] = {}
