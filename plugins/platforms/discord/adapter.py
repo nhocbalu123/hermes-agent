@@ -4716,6 +4716,21 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 _auto_register(plugin_name, plugin_desc, plugin_args_hint)
         except Exception as e:
             logger.warning("Discord auto-register from plugin commands failed: %s", e)
+        # Fork: `discord.top_level_skills` gives chosen skills their own slash command. The proxy
+        # sends "/<skill> <args>" down the normal skill-command path, same as typing it.
+        try:
+            wanted = (getattr(self.config, "extra", None) or {}).get("top_level_skills") or []
+            if wanted:
+                from hermes_cli.commands_platforms import discord_skill_commands_by_category
+                categories, uncategorized, _hidden = discord_skill_commands_by_category(reserved_names=set())
+                known = {n: d for n, d, _k in [*uncategorized, *(e for c in categories.values() for e in c)]}
+                for skill_name in wanted:
+                    if skill_name in known:
+                        _auto_register(skill_name, known[skill_name], "details (optional)")
+                    else:
+                        logger.warning("[%s] top_level_skills: no skill named %r", self.name, skill_name)
+        except Exception as e:
+            logger.warning("Discord top-level skill commands failed: %s", e)
         self._register_skill_group(tree)
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
@@ -7485,6 +7500,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key:
                 _env_default(env_key, str(value))
+    # Fork: skills promoted to top-level slash commands (adapter-only, no env bridge).
+    if isinstance(discord_cfg.get("top_level_skills"), list):
+        seeded_extra["top_level_skills"] = [str(s) for s in discord_cfg["top_level_skills"]]
     return seeded_extra or None
 
 
